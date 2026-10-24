@@ -4,7 +4,7 @@
  */
 
 import { InstrumentationConfig } from '@opentelemetry/instrumentation';
-import { Span } from '@opentelemetry/api';
+import { Span, TextMapPropagator } from '@opentelemetry/api';
 
 export interface MongoDBInstrumentationExecutionResponseHook {
   (span: Span, responseInfo: MongoResponseHookInformation): void;
@@ -19,6 +19,12 @@ export interface MongoDBInstrumentationExecutionResponseHook {
 export type DbStatementSerializer = (cmd: Record<string, unknown>) => string;
 
 export interface MongoDBInstrumentationConfig extends InstrumentationConfig {
+  /** Opt into context propagation through document-valued command comments. */
+  enableCommentPropagation?: boolean;
+
+  /** Override the global propagator for command comments only. */
+  commentPropagator?: TextMapPropagator;
+
   /**
    * If true, additional information about query parameters and
    * results will be attached (as `attributes`) to spans representing

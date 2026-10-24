@@ -45,6 +45,7 @@ export function accessCollection(
     }
     mongodb.MongoClient.connect(url, {
       serverSelectionTimeoutMS: 1000,
+      ...options,
     })
       .then((client: MongoClient) => {
         const db = client.db(dbName);

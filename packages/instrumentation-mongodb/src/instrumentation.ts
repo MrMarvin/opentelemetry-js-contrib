@@ -4,6 +4,8 @@
  */
 import {
   context,
+  createContextKey,
+  propagation,
   trace,
   Span,
   SpanKind,
@@ -55,6 +57,8 @@ import { PACKAGE_NAME, PACKAGE_VERSION } from './version';
 const DEFAULT_CONFIG: MongoDBInstrumentationConfig = {
   requireParentSpan: true,
 };
+
+const COMMENT_PROPAGATION = createContextKey('mongodb-comment-propagation');
 
 /** mongodb instrumentation plugin for OpenTelemetry */
 export class MongoDBInstrumentation extends InstrumentationBase<MongoDBInstrumentationConfig> {
@@ -127,6 +131,39 @@ export class MongoDBInstrumentation extends InstrumentationBase<MongoDBInstrumen
         undefined,
         undefined,
         [
+          new InstrumentationNodeModuleFile(
+            'mongodb/lib/cmap/commands.js',
+            ['>=4.0.0 <8'],
+            moduleExports => {
+              const name = moduleExports.OpMsgRequest ? 'OpMsgRequest' : 'Msg';
+              const instrumentation = this;
+              this._wrap(moduleExports, name, (original: any) => {
+                function Message(...args: any[]) {
+                  const message = Reflect.construct(original, args, new.target);
+                  const propagationInfo = context
+                    .active()
+                    .getValue(COMMENT_PROPAGATION) as
+                    | { connection: unknown; span?: Span }
+                    | undefined;
+                  return propagationInfo
+                    ? instrumentation._injectComment(
+                        propagationInfo.connection,
+                        message,
+                        propagationInfo.span
+                      )
+                    : message;
+                }
+                Message.prototype = original.prototype;
+                Object.setPrototypeOf(Message, original);
+                return Message;
+              });
+              return moduleExports;
+            },
+            moduleExports => {
+              const name = moduleExports.OpMsgRequest ? 'OpMsgRequest' : 'Msg';
+              this._unwrap(moduleExports, name);
+            }
+          ),
           new InstrumentationNodeModuleFile(
             'mongodb/lib/cmap/connection.js',
             ['>=4.0.0 <6.4'],
@@ -445,6 +482,77 @@ export class MongoDBInstrumentation extends InstrumentationBase<MongoDBInstrumen
     };
   }
 
+  private _injectComment(connection: any, message: any, span?: Span) {
+    const config = this.getConfig();
+    const description = connection.description;
+    if (
+      !config.enableCommentPropagation ||
+      !description ||
+      !(description.maxWireVersion >= 9) ||
+      !(description.maxBsonObjectSize > 0) ||
+      !(description.maxMessageSizeBytes > 0) ||
+      !message.command ||
+      message.command.hello ||
+      message.command.ismaster
+    ) {
+      return message;
+    }
+
+    try {
+      const comment: Record<string, unknown> = Object.create(null);
+      const setter = {
+        set(carrier: Record<string, unknown>, key: string, value: string) {
+          if (key !== 'originalComment' && typeof value === 'string') {
+            carrier[key] = value;
+          }
+        },
+      };
+      const propagationContext = span
+        ? trace.setSpan(context.active(), span)
+        : context.active();
+      if (config.commentPropagator) {
+        config.commentPropagator.inject(propagationContext, comment, setter);
+      } else {
+        propagation.inject(propagationContext, comment, setter);
+      }
+      for (const key of Object.keys(comment)) {
+        if (key === 'originalComment' || typeof comment[key] !== 'string') {
+          delete comment[key];
+        }
+      }
+      if (Object.keys(comment).length === 0) {
+        return message;
+      }
+      if (Object.prototype.hasOwnProperty.call(message.command, 'comment')) {
+        comment.originalComment = message.command.comment;
+      }
+
+      const command = { ...message.command, comment };
+      const candidate = Object.assign(
+        Object.create(Object.getPrototypeOf(message)),
+        message,
+        { command: { ...command } }
+      );
+      const buffers = candidate.toBin();
+      if (!Array.isArray(buffers)) {
+        return message;
+      }
+      const serialized = Buffer.concat(buffers);
+      if (
+        serialized.length < 25 ||
+        serialized.readInt32LE(12) !== 2013 ||
+        serialized.readInt32LE(21) > description.maxBsonObjectSize ||
+        serialized.length > description.maxMessageSizeBytes
+      ) {
+        return message;
+      }
+      message.command = command;
+    } catch (error) {
+      this._diag.debug('Skipping MongoDB comment context propagation', error);
+    }
+    return message;
+  }
+
   /** Creates spans for common operations */
   private _getV3PatchOperation(operationName: 'insert' | 'update' | 'remove') {
     const instrumentation = this;
@@ -598,6 +706,14 @@ export class MongoDBInstrumentation extends InstrumentationBase<MongoDBInstrumen
           commandType
         );
 
+        if (instrumentation.getConfig().enableCommentPropagation) {
+          const propagationContext = context
+            .active()
+            .setValue(COMMENT_PROPAGATION, { connection: this, span });
+          return context.with(propagationContext, () =>
+            original.call(this, ns, cmd, options, patchedCallback)
+          );
+        }
         return original.call(this, ns, cmd, options, patchedCallback);
       };
     };
@@ -644,7 +760,15 @@ export class MongoDBInstrumentation extends InstrumentationBase<MongoDBInstrumen
           commandType
         );
 
-        const result = original.apply(this, args);
+        const result = instrumentation.getConfig().enableCommentPropagation
+          ? context.with(
+              context.active().setValue(COMMENT_PROPAGATION, {
+                connection: this,
+                span,
+              }),
+              () => original.apply(this, args)
+            )
+          : original.apply(this, args);
         result.then(
           (res: any) => patchedCallback(null, res),
           (err: any) => patchedCallback(err)

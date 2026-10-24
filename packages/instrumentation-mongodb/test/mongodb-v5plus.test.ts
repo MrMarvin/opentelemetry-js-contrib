@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { context, trace, Span } from '@opentelemetry/api';
+import { context, trace, Span, propagation } from '@opentelemetry/api';
 import * as assert from 'assert';
 import {
   getInstrumentation,
@@ -14,13 +14,18 @@ import {
 } from '@opentelemetry/contrib-test-utils';
 import * as semver from 'semver';
 import { assertSpans, accessCollection, DEFAULT_MONGO_HOST } from './utils';
-import { ATTR_DB_QUERY_TEXT } from '@opentelemetry/semantic-conventions';
+import {
+  ATTR_DB_OPERATION_NAME,
+  ATTR_DB_QUERY_TEXT,
+} from '@opentelemetry/semantic-conventions';
 import {
   MongoDBInstrumentation,
   MongoDBInstrumentationConfig,
   MongoResponseHookInformation,
 } from '../src';
 import type { MongoClient, Collection } from 'mongodb';
+import type { Connection, Model } from 'mongoose';
+import { MongooseInstrumentation } from '@opentelemetry/instrumentation-mongoose';
 
 // Get instrumentation (singleton)
 let instrumentation: MongoDBInstrumentation;
@@ -59,7 +64,7 @@ describe('MongoDBInstrumentation-Tracing-v5+', () => {
   let collection: Collection;
 
   before(done => {
-    accessCollection(URL, DB_NAME, COLLECTION_NAME)
+    accessCollection(URL, DB_NAME, COLLECTION_NAME, { monitorCommands: true })
       .then(result => {
         client = result.client;
         collection = result.collection;
@@ -95,6 +100,153 @@ describe('MongoDBInstrumentation-Tracing-v5+', () => {
     if (client) {
       await client.close();
     }
+  });
+
+  describe('comment propagation', () => {
+    afterEach(() => create());
+
+    it('propagates driver span context for find, distinct, and aggregate', async () => {
+      create({ enableCommentPropagation: true });
+      const commands: any[] = [];
+      const onCommand = (event: any) => {
+        if (['find', 'distinct', 'aggregate'].includes(event.commandName)) {
+          commands.push(event.command);
+        }
+      };
+      client.on('commandStarted', onCommand);
+      const parent = trace.getTracer('test').startSpan('propagation');
+      const activeContext = propagation.setBaggage(
+        trace.setSpan(context.active(), parent),
+        propagation.createBaggage({ tenant: { value: 'test' } })
+      );
+      const originalComment = { job: 'rollup' };
+      try {
+        await context.with(activeContext, async () => {
+          await collection.find({}, { comment: originalComment }).toArray();
+          await collection.distinct('a', {}, { comment: null });
+          await collection.aggregate([{ $match: {} }]).toArray();
+        });
+      } finally {
+        parent.end();
+        client.removeListener('commandStarted', onCommand);
+      }
+      assert.strictEqual(commands.length, 3);
+      for (const command of commands) {
+        const operation = Object.keys(command)[0];
+        const span = getTestSpans().find(
+          finished => finished.attributes[ATTR_DB_OPERATION_NAME] === operation
+        );
+        assert(span);
+        const spanContext = span.spanContext();
+        assert.strictEqual(
+          command.comment.traceparent,
+          `00-${spanContext.traceId}-${spanContext.spanId}-01`
+        );
+        assert.strictEqual(command.comment.baggage, 'tenant=test');
+      }
+      assert.strictEqual(commands[0].comment.originalComment, originalComment);
+      assert.strictEqual(commands[1].comment.originalComment, null);
+      assert(!Object.hasOwn(commands[2].comment, 'originalComment'));
+      assert.deepStrictEqual(originalComment, { job: 'rollup' });
+    });
+
+    describe('Mongoose calls', () => {
+      const mongooseInstrumentation = new MongooseInstrumentation({
+        enabled: false,
+      });
+      let mongooseConnection: Connection;
+      let model: Model<{ a: number }>;
+
+      before(async function () {
+        if (!shouldTest) {
+          this.skip();
+        }
+        mongooseInstrumentation.setTracerProvider(trace.getTracerProvider());
+        mongooseInstrumentation.enable();
+        const mongoose: typeof import('mongoose') = require('mongoose');
+        mongooseConnection = await mongoose
+          .createConnection(URL, {
+            monitorCommands: true,
+            serverSelectionTimeoutMS: 1000,
+          })
+          .asPromise();
+        model = mongooseConnection.model<{ a: number }>(
+          'CommentPropagation',
+          new mongoose.Schema<{ a: number }>({ a: Number }),
+          COLLECTION_NAME
+        );
+      });
+
+      after(async () => {
+        mongooseInstrumentation.disable();
+        await mongooseConnection?.close();
+      });
+
+      for (const suppressInternalInstrumentation of [false, true]) {
+        it(`handles propagation with internal instrumentation suppressed=${suppressInternalInstrumentation}`, async () => {
+          mongooseInstrumentation.setConfig({
+            suppressInternalInstrumentation,
+          });
+          create({ enableCommentPropagation: true });
+          const mongooseClient = mongooseConnection.getClient();
+          const commands: any[] = [];
+          const onCommand = (event: any) => {
+            if (['find', 'distinct', 'aggregate'].includes(event.commandName)) {
+              commands.push(event.command);
+            }
+          };
+          mongooseClient.on('commandStarted', onCommand);
+          const parent = trace
+            .getTracer('test')
+            .startSpan('mongoose propagation');
+          try {
+            await context.with(
+              trace.setSpan(context.active(), parent),
+              async () => {
+                await model.find({}).comment('application comment');
+                await model.distinct('a');
+                await model.aggregate([{ $match: {} }]);
+              }
+            );
+          } finally {
+            parent.end();
+            mongooseClient.removeListener('commandStarted', onCommand);
+          }
+          assert.strictEqual(commands.length, 3);
+          for (const command of commands) {
+            const operation = Object.keys(command)[0];
+            const driverSpan = getTestSpans().find(
+              span =>
+                span.instrumentationScope.name ===
+                  '@opentelemetry/instrumentation-mongodb' &&
+                span.attributes[ATTR_DB_OPERATION_NAME] === operation
+            );
+            assert.strictEqual(!!driverSpan, !suppressInternalInstrumentation);
+            if (suppressInternalInstrumentation) {
+              assert.strictEqual(
+                command.comment,
+                operation === 'find' ? 'application comment' : undefined
+              );
+              continue;
+            }
+            assert(driverSpan);
+            const spanContext = driverSpan.spanContext();
+            assert.strictEqual(
+              command.comment.traceparent,
+              `00-${spanContext.traceId}-${spanContext.spanId}-01`
+            );
+          }
+          if (!suppressInternalInstrumentation) {
+            assert.strictEqual(
+              commands[0].comment.originalComment,
+              'application comment'
+            );
+            assert(!Object.hasOwn(commands[1].comment, 'originalComment'));
+            assert(!Object.hasOwn(commands[2].comment, 'originalComment'));
+          }
+        });
+      }
+    });
   });
 
   /** Should intercept query */

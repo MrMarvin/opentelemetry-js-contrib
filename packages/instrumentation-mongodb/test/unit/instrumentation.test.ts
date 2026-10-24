@@ -4,7 +4,269 @@
  */
 
 import * as assert from 'assert';
+import {
+  context,
+  trace,
+  propagation,
+  TextMapPropagator,
+} from '@opentelemetry/api';
+import { getTestSpans } from '@opentelemetry/contrib-test-utils';
+import * as sinon from 'sinon';
 import { MongoDBInstrumentation } from '../../src';
+
+describe('MongoDB comment propagation', () => {
+  let instrumentation: MongoDBInstrumentation;
+  const traceparent = '00-1234567890abcdef1234567890abcdef-1234567890abcdef-01';
+  const propagator: TextMapPropagator = {
+    inject(_context, carrier, setter) {
+      setter.set(carrier, 'traceparent', traceparent);
+      setter.set(carrier, 'tracestate', 'vendor=value');
+    },
+    extract: activeContext => activeContext,
+    fields: () => ['traceparent', 'tracestate'],
+  };
+  const description = {
+    maxWireVersion: 9,
+    maxBsonObjectSize: 16777216,
+    maxMessageSizeBytes: 48000000,
+  };
+
+  beforeEach(() => {
+    instrumentation = new MongoDBInstrumentation({
+      enableCommentPropagation: true,
+      commentPropagator: propagator,
+    });
+  });
+
+  afterEach(() => {
+    instrumentation.disable();
+    sinon.restore();
+  });
+
+  function createMessage(command: Record<string, unknown> = { find: 'users' }) {
+    const { OpMsgRequest } = require('mongodb/lib/cmap/commands');
+    return new OpMsgRequest('test', command, {});
+  }
+
+  function inject(message: any, serverDescription: any = description) {
+    return (instrumentation as any)._injectComment(
+      { description: serverDescription },
+      message
+    );
+  }
+
+  it('is disabled by default', () => {
+    instrumentation.setConfig({});
+    const message = createMessage();
+    const originalCommand = message.command;
+    assert.strictEqual(inject(message), message);
+    assert.strictEqual(message.command, originalCommand);
+    assert.strictEqual(message.command.comment, undefined);
+  });
+
+  it('injects a document with all selected propagator fields', () => {
+    const message = createMessage();
+    inject(message);
+    assert.strictEqual(message.command.comment.traceparent, traceparent);
+    assert.strictEqual(message.command.comment.tracestate, 'vendor=value');
+    assert(!Object.hasOwn(message.command.comment, 'originalComment'));
+  });
+
+  it('uses the global propagator when no override is configured', () => {
+    instrumentation.setConfig({ enableCommentPropagation: true });
+    const globalInject = sinon
+      .stub(propagation, 'inject')
+      .callsFake((activeContext, carrier, setter) =>
+        propagator.inject(activeContext, carrier, setter!)
+      );
+    const message = createMessage();
+    inject(message);
+    assert(globalInject.calledOnce);
+    assert.strictEqual(message.command.comment.traceparent, traceparent);
+  });
+
+  for (const originalComment of [
+    'application comment',
+    '',
+    null,
+    0,
+    { job: 'rollup' },
+    ['job'],
+    new Date('2026-01-01T00:00:00Z'),
+    Buffer.from('original'),
+  ]) {
+    it(`preserves the original comment ${JSON.stringify(originalComment)}`, () => {
+      const message = createMessage({
+        find: 'users',
+        comment: originalComment,
+      });
+      inject(message);
+      assert.strictEqual(
+        message.command.comment.originalComment,
+        originalComment
+      );
+      assert.strictEqual(message.command.comment.traceparent, traceparent);
+    });
+  }
+
+  it('does not let a propagator populate originalComment or non-string fields', () => {
+    instrumentation.setConfig({
+      enableCommentPropagation: true,
+      commentPropagator: {
+        ...propagator,
+        inject(activeContext, carrier: any, setter) {
+          propagator.inject(activeContext, carrier, setter);
+          carrier.originalComment = 'forged';
+          carrier.invalid = { nested: true };
+          setter.set(carrier, 'originalComment', 'also forged');
+        },
+      },
+    });
+    const message = createMessage();
+    inject(message);
+    assert(!Object.hasOwn(message.command.comment, 'originalComment'));
+    assert(!Object.hasOwn(message.command.comment, 'invalid'));
+  });
+
+  for (const style of ['Callback', 'Promise']) {
+    it(`propagates the driver span without changing active context (${style})`, async () => {
+      instrumentation.setConfig({ enableCommentPropagation: true });
+      instrumentation.setTracerProvider(trace.getTracerProvider());
+      const commandsModule = require('mongodb/lib/cmap/commands');
+      const module = instrumentation.init()[1].files![0];
+      module.patch!(commandsModule);
+      const parent = trace.getTracer('test').startSpan('parent');
+      const connection = { description, address: 'localhost:27017', id: 1 };
+      let injectedTraceparent: string | undefined;
+      const original = function (
+        this: unknown,
+        _namespace: unknown,
+        command: Record<string, unknown>,
+        _options: unknown,
+        callback?: (error: null, result: unknown) => void
+      ) {
+        assert.strictEqual(this, connection);
+        assert.strictEqual(trace.getSpan(context.active()), parent);
+        const message = createMessage(command);
+        injectedTraceparent = message.command.comment.traceparent;
+        if (style === 'Callback') {
+          callback!(null, { ok: 1 });
+          return;
+        }
+        return Promise.resolve({ ok: 1 });
+      };
+      const wrapped = (instrumentation as any)[`_getV4PatchCommand${style}`]()(
+        original
+      );
+      try {
+        await context.with(trace.setSpan(context.active(), parent), () =>
+          wrapped.call(
+            connection,
+            { db: 'test', collection: 'users' },
+            { find: 'users' },
+            {},
+            () => assert.strictEqual(trace.getSpan(context.active()), parent)
+          )
+        );
+        const driverSpan = getTestSpans().find(
+          span => span.name === 'find users'
+        );
+        assert(driverSpan);
+        const spanContext = driverSpan.spanContext();
+        assert.strictEqual(
+          injectedTraceparent,
+          `00-${spanContext.traceId}-${spanContext.spanId}-01`
+        );
+      } finally {
+        parent.end();
+        module.unpatch!(commandsModule);
+      }
+    });
+  }
+
+  for (const serverDescription of [
+    undefined,
+    {},
+    { ...description, maxWireVersion: 8 },
+  ]) {
+    it('skips unknown or unsupported server capabilities', () => {
+      const message = createMessage();
+      const originalCommand = message.command;
+      (instrumentation as any)._injectComment(
+        { description: serverDescription },
+        message
+      );
+      assert.strictEqual(message.command, originalCommand);
+    });
+  }
+
+  for (const limit of ['maxBsonObjectSize', 'maxMessageSizeBytes']) {
+    for (const originalComment of [undefined, null, 'original']) {
+      it(`leaves the command unchanged when injection exceeds ${limit}`, () => {
+        const command: Record<string, unknown> = { find: 'users' };
+        if (originalComment !== undefined) {
+          command.comment = originalComment;
+        }
+        const message = createMessage(command);
+        const originalCommand = message.command;
+        const originalSize = Buffer.concat(message.toBin()).length;
+        inject(message, {
+          ...description,
+          [limit]:
+            limit === 'maxBsonObjectSize' ? originalSize - 21 : originalSize,
+        });
+        assert.strictEqual(message.command, originalCommand);
+        assert.strictEqual(message.command.comment, originalComment);
+      });
+    }
+  }
+
+  it('leaves the command unchanged when a propagator injects nothing', () => {
+    instrumentation.setConfig({
+      enableCommentPropagation: true,
+      commentPropagator: { ...propagator, inject() {} },
+    });
+    const message = createMessage();
+    const originalCommand = message.command;
+    inject(message);
+    assert.strictEqual(message.command, originalCommand);
+  });
+
+  it('does not fail a command when propagation throws', () => {
+    instrumentation.setConfig({
+      enableCommentPropagation: true,
+      commentPropagator: {
+        ...propagator,
+        inject() {
+          throw new Error('propagator failure');
+        },
+      },
+    });
+    const message = createMessage();
+    const originalCommand = message.command;
+    assert.doesNotThrow(() => inject(message));
+    assert.strictEqual(message.command, originalCommand);
+  });
+
+  it('does not fail a command when serialization throws', () => {
+    const message = createMessage();
+    message.toBin = () => {
+      throw new Error('serialization failure');
+    };
+    const originalCommand = message.command;
+    assert.doesNotThrow(() => inject(message));
+    assert.strictEqual(message.command, originalCommand);
+  });
+
+  for (const command of [{ hello: 1 }, { ismaster: 1 }]) {
+    it('does not inject into handshakes', () => {
+      const message = createMessage(command);
+      const originalCommand = message.command;
+      inject(message);
+      assert.strictEqual(message.command, originalCommand);
+    });
+  }
+});
 
 describe('DbStatementSerializer', () => {
   let instrumentation: MongoDBInstrumentation;

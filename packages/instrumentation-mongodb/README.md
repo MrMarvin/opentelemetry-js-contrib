@@ -51,6 +51,23 @@ Mongodb instrumentation has few options available to choose from. You can set th
 | `responseHook`              | function | Function for adding custom attributes from db response. See type `MongoDBInstrumentationExecutionResponseHook`. |
 | `dbStatementSerializer`     | function | Custom serializer function for the `db.statement` / `db.query.text` span attribute. See type `DbStatementSerializer`. |
 | `requireParentSpan`         | boolean  | Require a parent span in order to create mongodb spans, default when unset is `true`. |
+| `enableCommentPropagation` | boolean | Opt into context propagation through MongoDB command comments. Defaults to `false`. |
+| `commentPropagator` | TextMapPropagator | Override the global propagator for command comments only. |
+
+### Context Propagation
+
+Set `enableCommentPropagation: true` to propagate context through a BSON document
+in the command's `comment` field. This implements the development convention in
+[semantic-conventions#4056](https://github.com/open-telemetry/semantic-conventions/pull/4056).
+The global propagator is used unless `commentPropagator` is configured. For example,
+a W3C Trace Context propagator injects `traceparent` and, when present, `tracestate`.
+An application-provided comment is preserved under `originalComment`, retaining
+its BSON type, including explicit `null`.
+
+Every injected field, including baggage when enabled by the propagator, may appear
+in database logs, profiling data, and diagnostic interfaces. Wrapping an existing
+comment changes its structure in those outputs. Use a W3C Trace Context-only
+`commentPropagator` to avoid propagating baggage.
 
 ## Semantic Conventions
 
